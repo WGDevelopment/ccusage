@@ -483,28 +483,51 @@ function filterByProject<T>(
 }
 
 /**
- * Checks if an entry is a duplicate based on hash
+ * Tracking data for deduplication with highest output_tokens priority
  */
-function isDuplicateEntry(
+type DedupeEntry = {
+	index: number;
+	outputTokens: number;
+};
+
+/**
+ * Checks if an entry should be skipped based on deduplication rules.
+ * Returns true if this is a duplicate with lower or equal output_tokens.
+ */
+function shouldSkipEntry(
 	uniqueHash: string | null,
-	processedHashes: Set<string>,
+	outputTokens: number,
+	processedHashes: Map<string, DedupeEntry>,
 ): boolean {
 	if (uniqueHash == null) {
 		return false;
 	}
-	return processedHashes.has(uniqueHash);
+	const existing = processedHashes.get(uniqueHash);
+	if (existing == null) {
+		return false;
+	}
+	return outputTokens <= existing.outputTokens;
 }
 
 /**
- * Marks an entry as processed
+ * Marks an entry as processed, returning the index of any entry that should be replaced
  */
 function markAsProcessed(
 	uniqueHash: string | null,
-	processedHashes: Set<string>,
-): void {
-	if (uniqueHash != null) {
-		processedHashes.add(uniqueHash);
+	outputTokens: number,
+	index: number,
+	processedHashes: Map<string, DedupeEntry>,
+): number | null {
+	if (uniqueHash == null) {
+		return null;
 	}
+	const existing = processedHashes.get(uniqueHash);
+	if (existing != null && outputTokens > existing.outputTokens) {
+		processedHashes.set(uniqueHash, { index, outputTokens });
+		return existing.index;
+	}
+	processedHashes.set(uniqueHash, { index, outputTokens });
+	return null;
 }
 
 /**
@@ -774,7 +797,8 @@ export async function loadDailyUsageData(
 	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
 
 	// Track processed message+request combinations for deduplication
-	const processedHashes = new Set<string>();
+	const processedHashes = new Map<string, DedupeEntry>();
+	const indicesToRemove = new Set<number>();
 
 	// Collect all valid data entries first
 	const allEntries: { data: UsageData; date: string; cost: number; model: string | undefined; project: string }[] = [];
@@ -794,13 +818,11 @@ export async function loadDailyUsageData(
 
 				// Check for duplicate message + request ID combination
 				const uniqueHash = createUniqueHash(data);
-				if (isDuplicateEntry(uniqueHash, processedHashes)) {
-					// Skip duplicate message
+				const outputTokens = data.message.usage.output_tokens;
+				if (shouldSkipEntry(uniqueHash, outputTokens, processedHashes)) {
+					// Skip duplicate with lower or equal output_tokens
 					return;
 				}
-
-				// Mark this combination as processed
-				markAsProcessed(uniqueHash, processedHashes);
 
 				// Always use DEFAULT_LOCALE for date grouping to ensure YYYY-MM-DD format
 				const date = formatDate(data.timestamp, options?.timezone, DEFAULT_LOCALE);
@@ -810,7 +832,14 @@ export async function loadDailyUsageData(
 					? await calculateCostForEntry(data, mode, fetcher)
 					: data.costUSD ?? 0;
 
+				const currentIndex = allEntries.length;
 				allEntries.push({ data, date, cost, model: data.message.model, project });
+
+				// Mark as processed, get index of entry to remove if replacing
+				const indexToRemove = markAsProcessed(uniqueHash, outputTokens, currentIndex, processedHashes);
+				if (indexToRemove != null) {
+					indicesToRemove.add(indexToRemove);
+				}
 			}
 			catch {
 				// Skip invalid JSON lines
@@ -818,14 +847,17 @@ export async function loadDailyUsageData(
 		});
 	}
 
+	// Filter out replaced entries
+	const dedupedEntries = allEntries.filter((_, index) => !indicesToRemove.has(index));
+
 	// Group by date, optionally including project
 	// Automatically enable project grouping when project filter is specified
 	const needsProjectGrouping = options?.groupByProject === true || options?.project != null;
 	const groupingKey = needsProjectGrouping
-		? (entry: typeof allEntries[0]) => `${entry.date}\x00${entry.project}`
-		: (entry: typeof allEntries[0]) => entry.date;
+		? (entry: typeof dedupedEntries[0]) => `${entry.date}\x00${entry.project}`
+		: (entry: typeof dedupedEntries[0]) => entry.date;
 
-	const groupedData = groupBy(allEntries, groupingKey);
+	const groupedData = groupBy(dedupedEntries, groupingKey);
 
 	// Aggregate each group
 	const results = Object.entries(groupedData)
@@ -924,7 +956,8 @@ export async function loadSessionData(
 	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
 
 	// Track processed message+request combinations for deduplication
-	const processedHashes = new Set<string>();
+	const processedHashes = new Map<string, DedupeEntry>();
+	const indicesToRemove = new Set<number>();
 
 	// Collect all valid data entries with session info first
 	const allEntries: Array<{
@@ -959,19 +992,18 @@ export async function loadSessionData(
 
 				// Check for duplicate message + request ID combination
 				const uniqueHash = createUniqueHash(data);
-				if (isDuplicateEntry(uniqueHash, processedHashes)) {
-				// Skip duplicate message
+				const outputTokens = data.message.usage.output_tokens;
+				if (shouldSkipEntry(uniqueHash, outputTokens, processedHashes)) {
+					// Skip duplicate with lower or equal output_tokens
 					return;
 				}
-
-				// Mark this combination as processed
-				markAsProcessed(uniqueHash, processedHashes);
 
 				const sessionKey = `${projectPath}/${sessionId}`;
 				const cost = fetcher != null
 					? await calculateCostForEntry(data, mode, fetcher)
 					: data.costUSD ?? 0;
 
+				const currentIndex = allEntries.length;
 				allEntries.push({
 					data,
 					sessionKey,
@@ -981,6 +1013,12 @@ export async function loadSessionData(
 					timestamp: data.timestamp,
 					model: data.message.model,
 				});
+
+				// Mark as processed, get index of entry to remove if replacing
+				const indexToRemove = markAsProcessed(uniqueHash, outputTokens, currentIndex, processedHashes);
+				if (indexToRemove != null) {
+					indicesToRemove.add(indexToRemove);
+				}
 			}
 			catch {
 				// Skip invalid JSON lines
@@ -988,9 +1026,12 @@ export async function loadSessionData(
 		});
 	}
 
+	// Filter out replaced entries
+	const dedupedEntries = allEntries.filter((_, index) => !indicesToRemove.has(index));
+
 	// Group by session using Object.groupBy
 	const groupedBySessions = groupBy(
-		allEntries,
+		dedupedEntries,
 		entry => entry.sessionKey,
 	);
 
@@ -1354,7 +1395,8 @@ export async function loadSessionBlockData(
 	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
 
 	// Track processed message+request combinations for deduplication
-	const processedHashes = new Set<string>();
+	const processedHashes = new Map<string, DedupeEntry>();
+	const indicesToRemove = new Set<number>();
 
 	// Collect all valid data entries first
 	const allEntries: LoadedUsageEntry[] = [];
@@ -1371,13 +1413,11 @@ export async function loadSessionBlockData(
 
 				// Check for duplicate message + request ID combination
 				const uniqueHash = createUniqueHash(data);
-				if (isDuplicateEntry(uniqueHash, processedHashes)) {
-				// Skip duplicate message
+				const outputTokens = data.message.usage.output_tokens;
+				if (shouldSkipEntry(uniqueHash, outputTokens, processedHashes)) {
+					// Skip duplicate with lower or equal output_tokens
 					return;
 				}
-
-				// Mark this combination as processed
-				markAsProcessed(uniqueHash, processedHashes);
 
 				const cost = fetcher != null
 					? await calculateCostForEntry(data, mode, fetcher)
@@ -1386,6 +1426,7 @@ export async function loadSessionBlockData(
 				// Get Claude Code usage limit expiration date
 				const usageLimitResetTime = getUsageLimitResetTime(data);
 
+				const currentIndex = allEntries.length;
 				allEntries.push({
 					timestamp: new Date(data.timestamp),
 					usage: {
@@ -1399,6 +1440,12 @@ export async function loadSessionBlockData(
 					version: data.version,
 					usageLimitResetTime: usageLimitResetTime ?? undefined,
 				});
+
+				// Mark as processed, get index of entry to remove if replacing
+				const indexToRemove = markAsProcessed(uniqueHash, outputTokens, currentIndex, processedHashes);
+				if (indexToRemove != null) {
+					indicesToRemove.add(indexToRemove);
+				}
 			}
 			catch (error) {
 				// Skip invalid JSON lines but log for debugging purposes
@@ -1407,8 +1454,11 @@ export async function loadSessionBlockData(
 		});
 	}
 
+	// Filter out replaced entries
+	const dedupedEntries = allEntries.filter((_, index) => !indicesToRemove.has(index));
+
 	// Identify session blocks
-	const blocks = identifySessionBlocks(allEntries, options?.sessionDurationHours);
+	const blocks = identifySessionBlocks(dedupedEntries, options?.sessionDurationHours);
 
 	// Filter by date range if specified
 	const dateFiltered = (options?.since != null && options.since !== '') || (options?.until != null && options.until !== '')
@@ -4400,7 +4450,7 @@ if (import.meta.vitest != null) {
 				expect(data[0]?.outputTokens).toBe(50);
 			});
 
-			it('should process files in chronological order', async () => {
+			it('should keep entry with highest output_tokens during deduplication', async () => {
 				await using fixture = await createFixture({
 					projects: {
 						'newer.jsonl': JSON.stringify({
@@ -4435,11 +4485,12 @@ if (import.meta.vitest != null) {
 					mode: 'display',
 				});
 
-				// Should keep the older entry (100/50 tokens) not the newer one (200/100)
+				// Should keep the entry with higher output_tokens (100) not the lower one (50)
+				// This fixes streaming artifacts where the same message has multiple entries
 				expect(data).toHaveLength(1);
-				expect(data[0]?.date).toBe('2025-01-10');
-				expect(data[0]?.inputTokens).toBe(100);
-				expect(data[0]?.outputTokens).toBe(50);
+				expect(data[0]?.date).toBe('2025-01-15');
+				expect(data[0]?.inputTokens).toBe(200);
+				expect(data[0]?.outputTokens).toBe(100);
 			});
 		});
 
